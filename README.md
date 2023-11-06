@@ -1,3 +1,7 @@
+### This fork contains modificaitons for passing a qptiff file as input
+
+ ```python CommandSingleCellExtraction.py --masks ../../Mask.tif --channel_names ../../Markers.csv --image ../../xyz.qptiff --output ../../Documents/xyz```
+ 
 # Single cell quantification
 Module for single-cell data extraction given a segmentation mask and multi-channel image. The CSV structure is aligned with histoCAT output.
 
