@@ -8,21 +8,11 @@ import pandas as pd
 import numpy as np
 import os
 import skimage.measure as measure
-import tifffile
+from tifffile import *
 
 from pathlib import Path
 
-#### Additional functions that can be specified by the user via intensity_props
 
-## Function to calculate median intensity values per mask 
-def intensity_median(mask, intensity):
-    return np.median(intensity[mask])
-
-## Function to sum intensity values (or in this case transcript counts)
-def intensity_sum(mask, intensity):
-    return np.sum(intensity[mask])
-
-## Function to calculate the gini index: https://en.wikipedia.org/wiki/Gini_coefficient
 def gini_index(mask, intensity):
     x = intensity[mask]
     sorted_x = np.sort(x)
@@ -30,7 +20,10 @@ def gini_index(mask, intensity):
     cumx = np.cumsum(sorted_x, dtype=float)
     return (n + 1 - 2 * np.sum(cumx) / cumx[-1]) / n
 
-def MaskChannel(mask_loaded, image_loaded_z, intensity_props=["intensity_mean"]):
+def median_intensity(mask, intensity):
+    return np.median(intensity[mask])
+
+def MaskChannel(mask_loaded, image_loaded_z, intensity_props=["mean_intensity"]):
     """Function for quantifying a single channel image
 
     Returns a table with CellID according to the mask and the mean pixel intensity
@@ -81,25 +74,6 @@ def MaskIDs(mask, mask_props=None):
 
     return dat
 
-def n_channels(image):
-    """Returns the number of channel in the input image. Supports [OME]TIFF and HDF5."""
-
-    image_path = Path(image)
-
-    if image_path.suffix in ['.tiff', '.tif', '.btf']:
-        s = tifffile.TiffFile(image).series[0]
-        ndim = len(s.shape)
-        if ndim == 2: return 1
-        elif ndim == 3: return min(s.shape)
-        else: raise Exception('mcquant supports only 2D/3D images.')
-
-    elif image_path.suffix in ['.h5', '.hdf5']:
-        f = h5py.File(image, 'r')
-        dat_name = list(f.keys())[0]
-        return f[dat_name].shape[3]
-
-    else:
-        raise Exception('mcquant currently supports [OME]TIFF and HDF5 formats only')
 
 def PrepareData(image,z):
     """Function for preparing input for maskzstack function. Connecting function
@@ -108,26 +82,51 @@ def PrepareData(image,z):
     image_path = Path(image)
 
     #Check to see if image tif(f)
-    if image_path.suffix in ['.tiff', '.tif', '.btf']:
-        image_loaded_z = tifffile.imread(image, key=z)
+    if image_path.suffix == '.tiff' or image_path.suffix == '.tif' or image_path.suffix == '.btf' or image_path.suffix == '.qptiff':
+        #Check to see if the image is ome.tif(f)
+        if  image.endswith(('.ome.tif','.ome.tiff')):
+            #Read the image
+            image_loaded_z = skimage.io.imread(image,img_num=z,plugin='tifffile')
+            #print('OME TIF(F) found')
+        else:
+            #Read the image
+            image_loaded_z = skimage.io.imread(image,img_num=z,plugin='tifffile')
+            #print('TIF(F) found')
+            # Remove extra axis
+            #image_loaded = image_loaded.reshape((image_loaded.shape[1],image_loaded.shape[3],image_loaded.shape[4]))
 
     #Check to see if image is hdf5
-    elif image_path.suffix in ['.h5', '.hdf5']:
+    elif image_path.suffix == '.h5' or image_path.suffix == '.hdf5':
         #Read the image
-        f = h5py.File(image,'r')
+        f = h5py.File(image,'r+')
         #Get the dataset name from the h5 file
         dat_name = list(f.keys())[0]
-        #Retrieve the z^th channel
-        image_loaded_z = f[dat_name][0,:,:,z]
-
-    else:
-        raise Exception('mcquant currently supports [OME]TIFF and HDF5 formats only')
+        ###If the hdf5 is exported from ilastik fiji plugin, the dat_name will be 'data'
+        #Get the image data
+        image_loaded = np.array(f[dat_name])
+        #Remove the first axis (ilastik convention)
+        image_loaded = image_loaded.reshape((image_loaded.shape[1],image_loaded.shape[2],image_loaded.shape[3]))
+        ###If the hdf5 is exported from ilastik fiji plugin, the order will need to be
+        ###switched as above --> z_stack = np.swapaxes(z_stack,0,2) --> z_stack = np.swapaxes(z_stack,0,1)
 
     #Return the objects
     return image_loaded_z
 
+#Input all data from file
+def qptiff_in(inFile):
+	with TiffFile(inFile) as tif:
+		tif_tags = {}
+		for tag in tif.pages[0].tags.values():
+			name, value = tag.name, tag.value
+			tif_tags[name] = value
+			#images = tif.asarray()
+		pages = [tif.asarray(),tif_tags]
+		shapes=[]
+		for series in tif.series:
+			shapes.append(series.shape)
+	return pages,shapes
 
-def MaskZstack(masks_loaded,image,channel_names_loaded, mask_props=None, intensity_props=["intensity_mean"]):
+def MaskZstack(masks_loaded,image,channel_names_loaded, mask_props=None, intensity_props=["mean_intensity"], channel_starts = None, channel_ends = None):
     """This function will extract the stats for each cell mask through each channel
     in the input image
 
@@ -135,15 +134,35 @@ def MaskZstack(masks_loaded,image,channel_names_loaded, mask_props=None, intensi
 
     z_stack: Multichannel z stack image"""
 
+    # Check if channel_starts and channel_ends are given
+    if channel_starts is None:
+        channel_starts = [1]*len(channel_names_loaded)
+    if channel_ends is None:
+        channel_ends = [255]*len(channel_names_loaded)
+
+
     #Get the names of the keys for the masks dictionary
     mask_names = list(masks_loaded.keys())
 
     #Create empty dictionary to store channel results per mask
     dict_of_chan = {m_name: [] for m_name in mask_names}
     #Get the z channel and the associated channel name from list of channel names
+    if Path(image).suffix == '.qptiff':
+        print("Reading qptiff...")
+        (all_pages, shapes) = qptiff_in(image)
+        
     for z in range(len(channel_names_loaded)):
         #Run the data Prep function
-        image_loaded_z = PrepareData(image,z)
+        if Path(image).suffix == '.qptiff':
+            image_loaded_z = all_pages[0][z]
+        else:
+            image_loaded_z = PrepareData(image,z)
+
+        # Threshold the image if start and end are given
+        print(np.min(image_loaded_z[np.nonzero(image_loaded_z)]),image_loaded_z.max())
+        image_loaded_z = np.clip(a=image_loaded_z,a_min=0, a_max = channel_ends[z])
+        image_loaded_z[image_loaded_z < channel_starts[z]] = 0
+        print(np.min(image_loaded_z[np.nonzero(image_loaded_z)]),image_loaded_z.max())
 
         #Iterate through number of masks to extract single cell data
         for nm in range(len(mask_names)):
@@ -181,10 +200,10 @@ def MaskZstack(masks_loaded,image,channel_names_loaded, mask_props=None, intensi
         mask_dict = {}
         # Mean intensity is default property, stored without suffix
         mask_dict.update(
-            zip(channel_names_loaded, [x["intensity_mean"] for x in dict_of_chan[nm]])
+            zip(channel_names_loaded, [x["mean_intensity"] for x in dict_of_chan[nm]])
         )
         # All other properties are suffixed with their names
-        for prop_n in set(dict_of_chan[nm][0].keys()).difference(["intensity_mean"]):
+        for prop_n in set(dict_of_chan[nm][0].keys()).difference(["mean_intensity"]):
             mask_dict.update(
                 zip([f"{n}_{prop_n}" for n in channel_names_loaded], [x[prop_n] for x in dict_of_chan[nm]])
             )
@@ -196,31 +215,44 @@ def MaskZstack(masks_loaded,image,channel_names_loaded, mask_props=None, intensi
     # Return the dict of dataframes for each mask
     return dict_of_chan
 
-def ExtractSingleCells(masks,image,channel_names,output, mask_props=None, intensity_props=["intensity_mean"]):
+def ExtractSingleCells(masks,image,channel_names,output, mask_props=None, intensity_props=["mean_intensity"]):
     """Function for extracting single cell information from input
     path containing single-cell masks, z_stack path, and channel_names path."""
 
     #Create pathlib object for output
     output = Path(output)
 
+    #Check if header available
+    #sniffer = csv.Sniffer()
+    #sniffer.has_header(open(channel_names).readline())
+    #If header not available
+    #if not sniffer:
+        #If header available
+        #channel_names_loaded = pd.read_csv(channel_names)
+        #channel_names_loaded_list = list(channel_names_loaded.marker_name)
+    #else:
+        #print("negative")
+        #old one column version
+        #channel_names_loaded = pd.read_csv(channel_names,header=None)
+        #Add a column index for ease
+        #channel_names_loaded.columns = ["marker"]
+        #channel_names_loaded = list(channel_names_loaded.marker.values)
+
     #Read csv channel names
     channel_names_loaded = pd.read_csv(channel_names)
-    #Check for the presence of `marker_name` column
-    if 'marker_name' in channel_names_loaded:
+    channel_starts = channel_names_loaded.start.values
+    channel_ends = channel_names_loaded.end.values
+    #Check for size of columns
+    if channel_names_loaded.shape[1] > 1:
         #Get the marker_name column if more than one column (CyCIF structure)
         channel_names_loaded_list = list(channel_names_loaded.marker_name)
-    #Consider the old one-marker-per-line plain text format
-    elif channel_names_loaded.shape[1] == 1:
-        #re-read the csv file and add column name
-        channel_names_loaded = pd.read_csv(channel_names, header = None)
-        channel_names_loaded_list = list(channel_names_loaded.iloc[:,0])
     else:
-        raise Exception('%s must contain the marker_name column'%channel_names)
+        #old one column version -- re-read the csv file and add column name
+        channel_names_loaded = pd.read_csv(channel_names, header = None)
+        #Add a column index for ease and for standardization
+        channel_names_loaded.columns = ["marker"]
+        channel_names_loaded_list = list(channel_names_loaded.marker)
 
-    #Contrast against the number of markers in the image
-    if len(channel_names_loaded_list) != n_channels(image):
-        raise Exception("The number of channels in %s doesn't match the image"%channel_names)
-    
     #Check for unique marker names -- create new list to store new names
     channel_names_loaded_checked = []
     for idx,val in enumerate(channel_names_loaded_list):
@@ -232,23 +264,23 @@ def ExtractSingleCells(masks,image,channel_names,output, mask_props=None, intens
             #Otherwise, leave channel name
             channel_names_loaded_checked.append(val)
 
+    #Clear small memory amount by clearing old channel names
+    channel_names_loaded, channel_names_loaded_list = None, None
+
     #Read the masks
     masks_loaded = {}
     #iterate through mask paths and read images to add to dictionary object
     for m in masks:
         m_full_name = os.path.basename(m)
         m_name = m_full_name.split('.')[0]
-        masks_loaded.update({str(m_name):skimage.io.imread(m,plugin='tifffile')})
+        #masks_loaded.update({str(m_name):skimage.io.imread(m,plugin='tifffile')})
+        masks_loaded.update({str(m_name):skimage.io.imread(m,plugin='tifffile').astype('int32')})
 
-    scdata_z = MaskZstack(masks_loaded,image,channel_names_loaded_checked, mask_props=mask_props, intensity_props=intensity_props)
+    scdata_z = MaskZstack(masks_loaded,image,channel_names_loaded_checked, mask_props=mask_props, intensity_props=intensity_props, channel_starts=channel_starts, channel_ends=channel_ends)
     #Write the singe cell data to a csv file using the image name
 
-    # Determine the image name by cutting off its extension
     im_full_name = os.path.basename(image)
-    im_tokens = im_full_name.split(os.extsep)
-    if len(im_tokens) < 2: im_name = im_tokens[0]
-    elif im_tokens[-2] == "ome": im_name = os.extsep.join(im_tokens[0:-2])
-    else: im_name = os.extsep.join(im_tokens[0:-1])
+    im_name = im_full_name.split('.')[0]
 
     # iterate through each mask and export csv with mask name as suffix
     for k,v in scdata_z.items():
@@ -260,7 +292,7 @@ def ExtractSingleCells(masks,image,channel_names,output, mask_props=None, intens
                             )
 
 
-def MultiExtractSingleCells(masks,image,channel_names,output, mask_props=None, intensity_props=["intensity_mean"]):
+def MultiExtractSingleCells(masks,image,channel_names,output, mask_props=None, intensity_props=["mean_intensity"]):
     """Function for iterating over a list of z_stacks and output locations to
     export single-cell data from image masks"""
 
